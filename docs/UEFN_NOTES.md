@@ -139,3 +139,30 @@ Constraints verified against official Epic Games UEFN Documentation ([Epic Devel
   - Modify locked editor-managed C++ struct properties (e.g. raw `FBodyInstance.bSimulatePhysics` reflection).
   - Run arbitrary unauthenticated network commands inside the sandbox.
   - Execute arbitrary runtime gameplay code during live island play (runtime gameplay is strictly Verse).
+
+---
+
+## 3. Non-Map Assets Verified Constraints (Audio, Skeletal Mesh, VFX)
+
+### 3.1 Audio Import Limits & Specifications
+- **Container Format**: Uncompressed 16-bit or 24-bit PCM WAV.
+- **Sample Rate**: 44.1 kHz or 48.0 kHz (48 kHz is the Unreal Audio Engine native mixing rate).
+- **Channels**: Mono (recommended for 3D positional/attenuated sounds) or Stereo (2D UI, music, announcer).
+- **Sound Devices**:
+  - `Audio Player Device` (`crd_audio_player_device`): supports Attenuation Radius, Spatialization, Volume, Pitch, and Loop control.
+  - `Radio Device` (`crd_radio_device`): for island-wide non-attenuated background music and announcer dialogue.
+- **Limits**: Sound assets must not exceed 100 MB per island project; streaming should be enabled on long audio tracks.
+
+### 3.2 Skeletal Meshes & Custom Animations
+- **Import Format**: FBX (binary FBX 2013–2020 format).
+- **Bone Limits**:
+  - Up to 256–512 bones per skeleton recommended.
+  - Maximum 4 bone influences per vertex for mobile/Switch tier; up to 8 influences supported for desktop/console high tier.
+- **Animation Sequences**: Supported as `AnimSequence` assets driven by Control Rig, AnimBP, or Level Sequencer (`Cinematic Sequence Device`).
+- **Player Locomotion Restriction**: Playable Fortnite characters must use the standard Fortnite humanoid skeleton. Custom TF2 character models can be displayed on NPC Spawner / Custom Character devices, but playable player locomotion is handled by Fortnite's character capsule.
+
+### 3.3 Visual Effects & Particle Systems
+- **System**: Unreal Niagara particle simulation graph (`NS_*`).
+- **Source PCF Compatibility**: Valve PCF files cannot be parsed directly by Unreal Engine. Visual effects must be mapped to equivalent Niagara systems or Fortnite Creative devices (e.g. `Explosive Device`, `VFX Spawner Device`, `Beacon Device`).
+- **Performance Budget**: Particle systems should avoid excessive sprite overdraw and limit max particle counts to 1,000–5,000 per burst to maintain 60 FPS on all Fortnite platforms.
+

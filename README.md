@@ -56,3 +56,21 @@ In order to find the import tools you simply need to go to File>Import>Source En
 | Half-Life: Alyx   | Partial support: (models, maps(not all entities), textures, materials(not all shaders)  |
 | S&BOX             | Partial support: Waiting for full release                                               |
 | Aperture Desk Job | Partial support: (models, maps(not all entities), textures, materials(not all shaders)  |
+
+---
+
+## UEFN (Unreal Editor for Fortnite) Export
+
+The `UNREAL-UEFN` branch provides an automated export and import pipeline to transfer Source 1 (Team Fortress 2) maps, static props, textures, materials, and audio into **Unreal Editor for Fortnite (UEFN)** via the **UEFN Toolbelt**.
+
+### Features:
+- **Meshes (`Meshes/`)**: Exports deduplicated static props as FBX assets with automatic convex collision hulls (`UCX_{mesh}_01`).
+- **Textures (`Textures/`)**: Converts VTF textures to PNG/TGA with normal map green channel inversion (OpenGL to DirectX convention), sRGB management, and power-of-two memory budget clamping.
+- **Materials (`Materials/`)**: Translates VMT shaders (`LightmappedGeneric`, `VertexLitGeneric`, `WorldVertexTransition`, `Water`, etc.) into structured UEFN Material Instance specifications.
+- **Audio (`Audio/`)**: Resolves and extracts TF2 soundscript events into UEFN-compliant 16-bit PCM WAV assets and emits `docs/AUDIO_MAPPING.md`.
+- **Manifest (`map_manifest.json`)**: Emits complete scene transforms (Source to Unreal cm, left-handed Z-up) and catalogs all gameplay entities (spawns, capture points, flags, resupply cabinets).
+- **Validation Report**: Generates `export_report.md` and `export_report.json` guaranteeing zero silent drops.
+- **UEFN Toolbelt Integration**: Includes `tf2_map_importer.py` for automated one-click actor placement and asset importation inside UEFN.
+
+> **Notice:** Team Fortress 2 assets and intellectual property belong to Valve Corporation; this tool and its exported outputs are strictly for private, non-commercial educational research and personal prototyping only. No publishing features are provided or supported.
+
