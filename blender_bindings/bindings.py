@@ -25,6 +25,7 @@ from .operators.source2_operators import (SOURCEIO_OT_VMAPImport,
                                           SOURCEIO_OT_VTEXImport,
                                           SOURCEIO_OT_DMXCameraImport)
 from .ui.export_nodes import register_nodes, unregister_nodes
+from .uefn import register as register_uefn, unregister as unregister_uefn
 from .utils.bpy_utils import is_blender_4_1
 
 
@@ -215,12 +216,14 @@ def register():
     register_()
     register_nodes()
     register_props()
+    register_uefn()
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.IMAGE_MT_image.append(vtf_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
+    unregister_uefn()
 
     # Taken from https://github.com/lasa01/Plumber/blob/master/plumber/__init__.py
     # if is_windows and False:
