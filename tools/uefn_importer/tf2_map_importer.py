@@ -429,7 +429,8 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
     failures: list[str] = []
     manual_steps: list[str] = []
 
-    # 1. Configure Textures (sRGB + Compression)
+    # 1. Configure Textures (sRGB + Compression) — only modify & batch-save changed textures
+    dirty_assets: list[Any] = []
     for tex_stem, meta in index_data.get("textures", {}).items():
         tex_path = f"{base_pkg}/Textures/{tex_stem}"
         tex_obj = load_asset(tex_path)
@@ -438,13 +439,23 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
         try:
             is_srgb = bool(meta.get("is_srgb", True))
             tex_type = meta.get("texture_type", "diffuse")
-            tex_obj.set_editor_property("srgb", is_srgb)
+            changed = False
+            if bool(tex_obj.get_editor_property("srgb")) != is_srgb:
+                tex_obj.set_editor_property("srgb", is_srgb)
+                changed = True
             if tex_type == "normal":
-                tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
-                tex_obj.set_editor_property("lod_group", unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP)
+                if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_NORMALMAP:
+                    tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+                    changed = True
+                if tex_obj.get_editor_property("lod_group") != unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP:
+                    tex_obj.set_editor_property("lod_group", unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP)
+                    changed = True
             elif tex_type in ("mask", "blend"):
-                tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
-            save_asset(tex_path)
+                if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_MASKS:
+                    tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
+                    changed = True
+            if changed:
+                dirty_assets.append(tex_obj)
         except Exception as e:
             failures.append(f"Texture config error ({tex_stem}): {e}")
 
@@ -491,8 +502,18 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
                 except Exception:
                     pass
 
-        save_asset(f"{materials_pkg}/{mi_name}")
+        dirty_assets.append(mi)
         materials_created += 1
+
+    if dirty_assets:
+        try:
+            unreal.EditorAssetLibrary.save_loaded_assets(dirty_assets, only_if_is_dirty=True)
+        except Exception:
+            for obj in dirty_assets:
+                try:
+                    unreal.EditorAssetLibrary.save_loaded_asset(obj, only_if_is_dirty=True)
+                except Exception:
+                    pass
 
     if missing_masters:
         manual_steps.append(
