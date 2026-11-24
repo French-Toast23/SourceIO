@@ -393,22 +393,23 @@ def _import_all_assets(
         except Exception as e:
             failures.append(f"Asset import batch {i} error: {e}")
 
-    # Configure ComplexAsSimple collision on world/displacement chunks so players can walk inside rooms
-    if meshes_dir.exists():
-        for fbx in meshes_dir.glob("*.fbx"):
-            if "world_chunk" in fbx.stem or "disp_chunk" in fbx.stem:
-                sm = load_asset(f"{base_pkg}/Meshes/{fbx.stem}")
-                if isinstance(sm, unreal.StaticMesh):
-                    try:
-                        body_setup = sm.get_editor_property("body_setup")
-                        if body_setup:
-                            body_setup.set_editor_property(
-                                "collision_trace_flag",
-                                unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE,
-                            )
-                            save_asset(f"{base_pkg}/Meshes/{fbx.stem}")
-                    except Exception as e:
-                        log_warning(f"Could not set ComplexAsSimple on {fbx.stem}: {e}")
+    # Configure ComplexAsSimple collision only for world/displacement chunks in this slice
+    chunk_stems = sorted(
+        {t.destination_name for t in tasks if "world_chunk" in t.destination_name or "disp_chunk" in t.destination_name}
+    )
+    for stem in chunk_stems:
+        sm = load_asset(f"{base_pkg}/Meshes/{stem}")
+        if isinstance(sm, unreal.StaticMesh):
+            try:
+                body_setup = sm.get_editor_property("body_setup")
+                if body_setup:
+                    body_setup.set_editor_property(
+                        "collision_trace_flag",
+                        unreal.CollisionTraceFlag.CTF_USE_COMPLEX_AS_SIMPLE,
+                    )
+                    save_asset(f"{base_pkg}/Meshes/{stem}")
+            except Exception as e:
+                log_warning(f"Could not set ComplexAsSimple on {stem}: {e}")
 
     return {"total_tasks": total_tasks, "imported_count": imported_count, "failures": failures}
 
@@ -522,90 +523,82 @@ def _spawn_actors_in_batches(
     sound_cache: dict[str, Optional[unreal.SoundWave]] = {}
 
     total = len(actors_data)
-    with unreal.ScopedSlowTask(total, "Spawning TF2 Map Actors...") as slow_task:
-        slow_task.make_dialog(True)
+    for start in range(0, total, batch_size):
+        batch = actors_data[start:start + batch_size]
+        with unreal.ScopedEditorTransaction(f"TF2 Spawn Batch {start}-{start + len(batch)}") as _:
+            for a_data in batch:
+                actor_name = a_data.get("actor_name", f"TF2_Actor_{spawned_count}")
+                asset_ref = a_data.get("asset_reference")
+                loc_list = a_data.get("location", [0.0, 0.0, 0.0])
+                rot_list = a_data.get("rotation", [0.0, 0.0, 0.0])
+                scale_list = a_data.get("scale", [1.0, 1.0, 1.0])
+                ent_class = a_data.get("entity_class", "prop_static")
+                is_gameplay = a_data.get("is_gameplay_entity", False)
+                is_skybox = a_data.get("is_skybox", False)
+                mat_overrides = a_data.get("material_overrides", [])
+                audio_spec = a_data.get("audio_spec")
 
-        for start in range(0, total, batch_size):
-            batch = actors_data[start:start + batch_size]
-            with unreal.ScopedEditorTransaction(f"TF2 Spawn Batch {start}-{start + len(batch)}") as _:
-                for a_data in batch:
-                    if slow_task.should_cancel():
-                        failures.append("Spawn cancelled by user.")
-                        return {"spawned_count": spawned_count, "failures": failures}
-                    slow_task.enter_progress_frame(1)
+                loc = unreal.Vector(float(loc_list[0]), float(loc_list[1]), float(loc_list[2]))
+                rot = unreal.Rotator(
+                    pitch=float(rot_list[0]),
+                    yaw=float(rot_list[1]),
+                    roll=float(rot_list[2]),
+                )
+                scale = unreal.Vector(float(scale_list[0]), float(scale_list[1]), float(scale_list[2]))
 
-                    actor_name = a_data.get("actor_name", f"TF2_Actor_{spawned_count}")
-                    asset_ref = a_data.get("asset_reference")
-                    loc_list = a_data.get("location", [0.0, 0.0, 0.0])
-                    rot_list = a_data.get("rotation", [0.0, 0.0, 0.0])
-                    scale_list = a_data.get("scale", [1.0, 1.0, 1.0])
-                    ent_class = a_data.get("entity_class", "prop_static")
-                    is_gameplay = a_data.get("is_gameplay_entity", False)
-                    is_skybox = a_data.get("is_skybox", False)
-                    mat_overrides = a_data.get("material_overrides", [])
-                    audio_spec = a_data.get("audio_spec")
+                try:
+                    if audio_spec is not None or ent_class in ("ambient_generic", "env_soundscape"):
+                        actor = actor_sub.spawn_actor_from_class(unreal.AmbientSound, loc, rot)
+                        if actor and asset_ref:
+                            snd_stem = Path(asset_ref).stem
+                            if snd_stem not in sound_cache:
+                                sound_cache[snd_stem] = load_asset(f"{base_pkg}/Audio/{snd_stem}")
+                            snd = sound_cache[snd_stem]
+                            comp = actor.get_component_by_class(unreal.AudioComponent)
+                            if comp and snd:
+                                comp.set_sound(snd)
+                            if comp and audio_spec:
+                                comp.set_volume_multiplier(float(audio_spec.get("volume", 1.0)))
+                        folder = "TF2_Map/Audio"
+                    elif is_gameplay and not asset_ref:
+                        actor = actor_sub.spawn_actor_from_class(unreal.TargetPoint, loc, rot)
+                        folder = f"TF2_Map/Gameplay/{ent_class}"
+                    else:
+                        actor = actor_sub.spawn_actor_from_class(unreal.StaticMeshActor, loc, rot)
+                        if actor and asset_ref:
+                            mesh_stem = Path(asset_ref).stem
+                            if mesh_stem not in mesh_cache:
+                                mesh_cache[mesh_stem] = load_asset(f"{base_pkg}/Meshes/{mesh_stem}")
+                            mesh_obj = mesh_cache[mesh_stem]
+                            sm_comp = getattr(actor, "static_mesh_component", None)
+                            if sm_comp and isinstance(mesh_obj, unreal.StaticMesh):
+                                sm_comp.set_static_mesh(mesh_obj)
+                                for slot_i, mi_name in enumerate(mat_overrides):
+                                    if mi_name not in mat_cache:
+                                        mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
+                                    mi_obj = mat_cache[mi_name]
+                                    if isinstance(mi_obj, unreal.MaterialInterface):
+                                        sm_comp.set_material(slot_i, mi_obj)
+                        folder = (
+                            "TF2_Map/Skybox" if is_skybox
+                            else ("TF2_Map/World" if ent_class == "worldspawn"
+                            else ("TF2_Map/Displacements" if ent_class == "displacement"
+                            else ("TF2_Map/Decals" if ent_class in ("info_overlay", "infodecal")
+                            else ("TF2_Map/Brushes" if ent_class.startswith("func_")
+                            else "TF2_Map/Props"))))
+                        )
 
-                    loc = unreal.Vector(float(loc_list[0]), float(loc_list[1]), float(loc_list[2]))
-                    rot = unreal.Rotator(
-                        pitch=float(rot_list[0]),
-                        yaw=float(rot_list[1]),
-                        roll=float(rot_list[2]),
-                    )
-                    scale = unreal.Vector(float(scale_list[0]), float(scale_list[1]), float(scale_list[2]))
+                    if not actor:
+                        failures.append(f"spawn_actor_from_class returned None for {actor_name}")
+                        continue
 
-                    try:
-                        if audio_spec is not None or ent_class in ("ambient_generic", "env_soundscape"):
-                            actor = actor_sub.spawn_actor_from_class(unreal.AmbientSound, loc, rot)
-                            if actor and asset_ref:
-                                snd_stem = Path(asset_ref).stem
-                                if snd_stem not in sound_cache:
-                                    sound_cache[snd_stem] = load_asset(f"{base_pkg}/Audio/{snd_stem}")
-                                snd = sound_cache[snd_stem]
-                                comp = actor.get_component_by_class(unreal.AudioComponent)
-                                if comp and snd:
-                                    comp.set_sound(snd)
-                                if comp and audio_spec:
-                                    comp.set_volume_multiplier(float(audio_spec.get("volume", 1.0)))
-                            folder = "TF2_Map/Audio"
-                        elif is_gameplay and not asset_ref:
-                            actor = actor_sub.spawn_actor_from_class(unreal.TargetPoint, loc, rot)
-                            folder = f"TF2_Map/Gameplay/{ent_class}"
-                        else:
-                            actor = actor_sub.spawn_actor_from_class(unreal.StaticMeshActor, loc, rot)
-                            if actor and asset_ref:
-                                mesh_stem = Path(asset_ref).stem
-                                if mesh_stem not in mesh_cache:
-                                    mesh_cache[mesh_stem] = load_asset(f"{base_pkg}/Meshes/{mesh_stem}")
-                                mesh_obj = mesh_cache[mesh_stem]
-                                sm_comp = getattr(actor, "static_mesh_component", None)
-                                if sm_comp and isinstance(mesh_obj, unreal.StaticMesh):
-                                    sm_comp.set_static_mesh(mesh_obj)
-                                    for slot_i, mi_name in enumerate(mat_overrides):
-                                        if mi_name not in mat_cache:
-                                            mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
-                                        mi_obj = mat_cache[mi_name]
-                                        if isinstance(mi_obj, unreal.MaterialInterface):
-                                            sm_comp.set_material(slot_i, mi_obj)
-                            folder = (
-                                "TF2_Map/Skybox" if is_skybox
-                                else ("TF2_Map/World" if ent_class == "worldspawn"
-                                else ("TF2_Map/Displacements" if ent_class == "displacement"
-                                else ("TF2_Map/Decals" if ent_class in ("info_overlay", "infodecal")
-                                else ("TF2_Map/Brushes" if ent_class.startswith("func_")
-                                else "TF2_Map/Props"))))
-                            )
-
-                        if not actor:
-                            failures.append(f"spawn_actor_from_class returned None for {actor_name}")
-                            continue
-
-                        actor.set_actor_label(actor_name)
-                        actor.set_actor_scale3d(scale)
-                        actor.tags.append(unreal.Name(TAG_TF2_IMPORTED))
-                        actor.set_folder_path(unreal.Name(folder))
-                        spawned_count += 1
-                    except Exception as e:
-                        failures.append(f"Exception spawning {actor_name}: {e}")
+                    actor.set_actor_label(actor_name)
+                    actor.set_actor_scale3d(scale)
+                    actor.tags.append(unreal.Name(TAG_TF2_IMPORTED))
+                    actor.set_folder_path(unreal.Name(folder))
+                    spawned_count += 1
+                except Exception as e:
+                    failures.append(f"Exception spawning {actor_name}: {e}")
 
     return {"spawned_count": spawned_count, "failures": failures}
 
