@@ -495,11 +495,13 @@ class UEFNMeshExporter:
     ) -> tuple[list[str], list[str]]:
         ue_names: list[str] = []
         src_paths: list[str] = []
+        new_mats: list[Any] = []
+        old_to_new: dict[int, int] = {}
+
         for idx in sorted(used_indices):
             if idx >= len(obj.material_slots):
                 continue
-            slot = obj.material_slots[idx]
-            mat = slot.material
+            mat = obj.material_slots[idx].material
             if mat is None:
                 continue
             src_path = get_material_source_path(mat)
@@ -512,11 +514,24 @@ class UEFNMeshExporter:
             if proxy_mat is None:
                 proxy_mat = bpy.data.materials.new(name=ue_name)
                 proxy_mat["uefn_proxy"] = True
-            slot.material = proxy_mat
-            if ue_name not in ue_names:
+
+            if proxy_mat in new_mats:
+                new_idx = new_mats.index(proxy_mat)
+            else:
+                new_idx = len(new_mats)
+                new_mats.append(proxy_mat)
                 ue_names.append(ue_name)
-            if src_path not in src_paths:
                 src_paths.append(src_path)
+            old_to_new[idx] = new_idx
+
+        mesh = obj.data
+        mesh.materials.clear()
+        for pm in new_mats:
+            mesh.materials.append(pm)
+        if old_to_new:
+            for poly in mesh.polygons:
+                poly.material_index = old_to_new.get(poly.material_index, 0)
+
         return ue_names, src_paths
 
     def export_brush_entity(

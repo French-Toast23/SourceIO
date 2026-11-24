@@ -92,6 +92,15 @@ TAG_TF2_IMPORTED = "TF2_Imported"
 
 
 def _base_content_path() -> str:
+    if IN_UNREAL:
+        try:
+            world = unreal.EditorLevelLibrary.get_editor_world()
+            if world:
+                parts = [p for p in str(world.get_path_name()).split("/") if p]
+                if parts:
+                    return f"/{parts[0]}/TF2_Map"
+        except Exception:
+            pass
     return f"/{detect_project_mount()}/TF2_Map"
 
 
@@ -219,7 +228,14 @@ def run_clean_imported(**kwargs) -> dict[str, Any]:
     description="Imports only Meshes, Textures, and Audio from the UEFN export folder.",
     tags=["tf2", "import", "assets"],
 )
-def run_import_assets_only(manifest_path: str = "", batch_size: int = 50, **kwargs) -> dict[str, Any]:
+def run_import_assets_only(
+    manifest_path: str = "",
+    batch_size: int = 50,
+    build_materials: bool = True,
+    offset: int = 0,
+    limit: int = 0,
+    **kwargs,
+) -> dict[str, Any]:
     if not IN_UNREAL:
         return {"status": "error", "error": "This tool must be run inside UEFN."}
     manifest_file = _resolve_manifest_path(manifest_path)
@@ -227,11 +243,12 @@ def run_import_assets_only(manifest_path: str = "", batch_size: int = 50, **kwar
         return {"status": "error", "error": f"Manifest not found: {manifest_file}"}
 
     base_pkg = _base_content_path()
-    asset_res = _import_all_assets(manifest_file.parent, base_pkg, batch_size=batch_size)
-    mat_res = _configure_textures_and_materials(manifest_file.parent, base_pkg)
+    asset_res = _import_all_assets(manifest_file.parent, base_pkg, batch_size=batch_size, offset=offset, limit=limit)
+    mat_res = _configure_textures_and_materials(manifest_file.parent, base_pkg) if build_materials else {"materials_created": 0, "manual_steps": [], "failures": []}
     return {
         "status": "ok",
         "project_mount": base_pkg,
+        "total_tasks": asset_res.get("total_tasks", 0),
         "imported_count": asset_res.get("imported_count", 0),
         "materials_created": mat_res.get("materials_created", 0),
         "manual_steps": mat_res.get("manual_steps", []),
@@ -249,6 +266,8 @@ def run_spawn_actors_only(
     manifest_path: str = "",
     batch_size: int = 250,
     include_skybox: bool = False,
+    offset: int = 0,
+    limit: int = 0,
     **kwargs,
 ) -> dict[str, Any]:
     if not IN_UNREAL:
@@ -263,9 +282,14 @@ def run_spawn_actors_only(
     actors = data.get("actors", [])
     if not include_skybox:
         actors = [a for a in actors if not a.get("is_skybox", False)]
+    total_actors = len(actors)
+    if offset > 0 or limit > 0:
+        end = offset + limit if limit > 0 else total_actors
+        actors = actors[offset:end]
     res = _spawn_actors_in_batches(actors, _base_content_path(), batch_size=max(1, batch_size))
     return {
         "status": "ok",
+        "total_manifest_actors": total_actors,
         "expected_actors": len(actors),
         "spawned_count": res.get("spawned_count", 0),
         "failures": res.get("failures", []),
@@ -292,7 +316,13 @@ def _resolve_manifest_path(user_path: str) -> Path:
     return candidates[0]
 
 
-def _import_all_assets(manifest_dir: Path, base_pkg: str, batch_size: int = 50) -> dict[str, Any]:
+def _import_all_assets(
+    manifest_dir: Path,
+    base_pkg: str,
+    batch_size: int = 50,
+    offset: int = 0,
+    limit: int = 0,
+) -> dict[str, Any]:
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
     tasks: list[unreal.AssetImportTask] = []
     failures: list[str] = []
@@ -346,13 +376,19 @@ def _import_all_assets(manifest_dir: Path, base_pkg: str, batch_size: int = 50) 
             task.save = True
             tasks.append(task)
 
+    total_tasks = len(tasks)
+    if offset > 0 or limit > 0:
+        end = offset + limit if limit > 0 else total_tasks
+        tasks = tasks[offset:end]
+
     imported_count = 0
     for i in range(0, len(tasks), batch_size):
         chunk = tasks[i:i + batch_size]
         try:
             asset_tools.import_asset_tasks(chunk)
             for t in chunk:
-                if t.imported_object_paths or t.get_editor_property("imported_object"):
+                objs = t.get_objects() if hasattr(t, "get_objects") else []
+                if getattr(t, "imported_object_paths", None) or objs:
                     imported_count += 1
         except Exception as e:
             failures.append(f"Asset import batch {i} error: {e}")
@@ -374,7 +410,7 @@ def _import_all_assets(manifest_dir: Path, base_pkg: str, batch_size: int = 50) 
                     except Exception as e:
                         log_warning(f"Could not set ComplexAsSimple on {fbx.stem}: {e}")
 
-    return {"imported_count": imported_count, "failures": failures}
+    return {"total_tasks": total_tasks, "imported_count": imported_count, "failures": failures}
 
 
 def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict[str, Any]:
@@ -510,7 +546,11 @@ def _spawn_actors_in_batches(
                     audio_spec = a_data.get("audio_spec")
 
                     loc = unreal.Vector(float(loc_list[0]), float(loc_list[1]), float(loc_list[2]))
-                    rot = unreal.Rotator(float(rot_list[0]), float(rot_list[1]), float(rot_list[2]))
+                    rot = unreal.Rotator(
+                        pitch=float(rot_list[0]),
+                        yaw=float(rot_list[1]),
+                        roll=float(rot_list[2]),
+                    )
                     scale = unreal.Vector(float(scale_list[0]), float(scale_list[1]), float(scale_list[2]))
 
                     try:
