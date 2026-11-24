@@ -105,21 +105,20 @@ Constraints verified against official Epic Games UEFN Documentation ([Epic Devel
   - `UBX_MeshName_##` for box collision.
   - `USP_MeshName_##` for sphere collision.
 - **Coordinate Conversion**:
-  - Source Engine: 1 Source Unit = 1 inch = 2.54 cm. Right-handed coordinate system (X Forward, Y Left, Z Up).
+  - Source Engine (GoldSrc / Source 1 TF2): 16 Hammer units = 1 foot (`30.48 cm`), so `1 HU = 1.905 cm` (`0.01905 m`, matching SourceIO's `SOURCE1_HAMMER_UNIT_TO_METERS`). Right-handed coordinate system (X Forward, Y Left, Z Up).
   - Unreal Engine: 1 Unreal Unit (uu) = 1 centimeter (cm). Left-handed coordinate system (X Forward, Y Right, Z Up).
   - Conversion transform:
-    $$\text{Position}_{UE} = (X_{Source} \times 2.54, -Y_{Source} \times 2.54, Z_{Source} \times 2.54)$$
+    $$\text{Position}_{UE} = (X_{Source} \times 1.905, -Y_{Source} \times 1.905, Z_{Source} \times 1.905)$$
     $$\text{Rotation}_{UE}: \text{Pitch}_{UE} = \text{Pitch}_{Source}, \text{Yaw}_{UE} = -\text{Yaw}_{Source}, \text{Roll}_{UE} = -\text{Roll}_{Source}$$
 
 ### 2.3 Texture Conventions & Limits
-- **Max Resolution**: 2048x2048 or 4096x4096 (power-of-two dimensions required for streaming and mipmap generation). Textures exceeding 4096 must be downscaled.
+- **Max Resolution**: 2048x2048 or 4096x4096 (power-of-two dimensions required for streaming and mipmap generation). Textures exceeding `max_size` (default 2048) or non-POT dimensions are downscaled via Pillow (Lanczos) or NumPy bilinear fallback (since Blender's bundled Python omits `PIL`).
 - **Color Spaces**:
   - Base Color / Albedo / Emissive: sRGB = True.
   - Normal Map, Roughness, Metallic, Ambient Occlusion, Masks: Linear / Non-Color (sRGB = False).
 - **Normal Map Green Channel**:
-  - Source Engine uses **OpenGL convention** (Y+ Up).
-  - Unreal Engine uses **DirectX convention** (Y- Down).
-  - When converting VTF normal maps for UEFN, the green channel must be inverted ($G_{UE} = 1.0 - G_{Source}$).
+  - Standard Source 1 VTF `$bumpmap` textures are natively **DirectX convention** (Y- Down), matching Unreal Engine (`SourceIO` only flips Green when importing into Blender's OpenGL shader nodes). Therefore `$bumpmap` green channels are preserved untouched when exporting for UEFN.
+  - Source 1 `$ssbump 1` self-shadowed bump maps encode lighting along Valve's 3-vector bump basis and ARE transformed via `_SSBUMP_BASIS_T` to tangent-space normals with DirectX (Y- Down) Green orientation.
 
 ### 2.4 Project Budgets & Memory
 - **Memory Thermometer**: UEFN enforces a strict island memory budget of 100,000 units.

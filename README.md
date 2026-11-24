@@ -64,13 +64,13 @@ In order to find the import tools you simply need to go to File>Import>Source En
 The `UNREAL-UEFN` branch provides an automated export and import pipeline to transfer Source 1 (Team Fortress 2) maps, static props, textures, materials, and audio into **Unreal Editor for Fortnite (UEFN)** via the **UEFN Toolbelt**.
 
 ### Features:
-- **Meshes (`Meshes/`)**: Exports deduplicated static props as FBX assets with automatic convex collision hulls (`UCX_{mesh}_01`).
-- **Textures (`Textures/`)**: Converts VTF textures to PNG/TGA with normal map green channel inversion (OpenGL to DirectX convention), sRGB management, and power-of-two memory budget clamping.
-- **Materials (`Materials/`)**: Translates VMT shaders (`LightmappedGeneric`, `VertexLitGeneric`, `WorldVertexTransition`, `Water`, etc.) into structured UEFN Material Instance specifications.
-- **Audio (`Audio/`)**: Resolves and extracts TF2 soundscript events into UEFN-compliant 16-bit PCM WAV assets and emits `docs/AUDIO_MAPPING.md`.
-- **Manifest (`map_manifest.json`)**: Emits complete scene transforms (Source to Unreal cm, left-handed Z-up) and catalogs all gameplay entities (spawns, capture points, flags, resupply cabinets).
+- **Meshes (`Meshes/`)**: Exports spatial world/displacement chunks, visible brush entities (`func_detail`, `func_door`, `func_brush`), BSP overlays (`LUMP_OVERLAYS`), and deduplicated MDL props at local origin with automatic combined convex collision hulls (`UCX_*_01`) and tool-face culling.
+- **Textures (`Textures/`)**: Converts VTF textures to PNG/TGA without third-party dependencies (DirectX Y- `$bumpmap` preserved natively, `$ssbump` basis-converted to DirectX normal, sRGB tagging, and power-of-two budget clamping).
+- **Materials (`Materials/`)**: Translates VMT shaders (`LightmappedGeneric`, `VertexLitGeneric`, `WorldVertexTransition`, `Water`, etc.) into structured UEFN Material Instance specifications (`MI_*.json` + `materials_index.json`).
+- **Audio (`Audio/`)**: Resolves TF2 KV1 soundscripts & soundscapes into UEFN-compliant 16-bit PCM WAV assets and emits `docs/AUDIO_MAPPING.md`.
+- **Manifest (`map_manifest.json`)**: Emits complete scene transforms (`1.905 cm/HU` Source to Unreal cm, left-handed Z-up), 3D skybox (`sky_camera`) metadata, invisible trigger bounds, and catalogs all gameplay entities (spawns, capture points, flags, resupply cabinets).
 - **Validation Report**: Generates `export_report.md` and `export_report.json` guaranteeing zero silent drops.
-- **UEFN Toolbelt Integration**: Includes `tf2_map_importer.py` for automated one-click actor placement and asset importation inside UEFN.
+- **UEFN Toolbelt Integration**: Includes `tools/uefn_importer/tf2_map_importer.py` for automated batched asset import, material instance creation, and actor placement under the active project mount (`/{project}/TF2_Map`). Replace any older `SourceIO-master` copy in Blender's addons folder with this fork to expose the `Export map for UEFN` panel in the Blender UI.
 
 > **Notice:** Team Fortress 2 assets and intellectual property belong to Valve Corporation; this tool and its exported outputs are strictly for private, non-commercial educational research and personal prototyping only. No publishing features are provided or supported.
 
