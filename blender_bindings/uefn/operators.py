@@ -10,7 +10,6 @@ Provides:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 try:
@@ -26,14 +25,19 @@ except ImportError:
     IN_BLENDER = False
 
 from SourceIO.logger import SourceLogMan
-from .export_pipeline import UEFNExportOptions, UEFNExportPipeline
+from .export_pipeline import UEFNExportOptions, UEFNExportPipeline, detect_tf2_game_dir
 
 log_manager = SourceLogMan()
 logger = log_manager.get_logger("UEFN::BlenderOperator")
 
 
+def _default_tf2_dir() -> str:
+    found = detect_tf2_game_dir()
+    return str(found) if found else ""
+
+
 class SOURCEIO_OT_ExportUEFN(Operator):
-    """Export the active TF2 map scene to Unreal Editor for Fortnite (UEFN)"""
+    """Export the active imported TF2 map scene (or BSP) to Unreal Editor for Fortnite (UEFN)"""
 
     bl_idname = "sourceio.export_uefn"
     bl_label = "Export Map for UEFN"
@@ -45,16 +49,23 @@ class SOURCEIO_OT_ExportUEFN(Operator):
         subtype="DIR_PATH",
     )
 
+    bsp_filepath: StringProperty(
+        name="BSP Map File",
+        description="Path to the compiled .bsp file (auto-detected from active scene if left blank)",
+        subtype="FILE_PATH",
+        default="",
+    )
+
     tf2_path: StringProperty(
         name="TF2 Mod Directory (tf)",
         description="Path to Team Fortress 2 'tf' folder containing gameinfo.txt and VPKs",
         subtype="DIR_PATH",
-        default=r"H:\SteamLibrary\steamapps\common\Team Fortress 2\tf",
+        default="",
     )
 
     generate_collision: BoolProperty(
         name="Generate UCX Collision",
-        description="Generate simplified convex collision hulls for all static meshes",
+        description="Generate simplified convex collision hulls (UCX_) for props and brush entities",
         default=True,
     )
 
@@ -76,16 +87,25 @@ class SOURCEIO_OT_ExportUEFN(Operator):
     )
 
     world_chunk_size: FloatProperty(
-        name="World Chunk Size",
-        description="Size in Hammer units for spatial grid chunking of static world geometry",
+        name="World Chunk Size (HU)",
+        description="Grid cell size in Hammer units for spatial chunking of static world geometry",
         default=2048.0,
         min=512.0,
         max=8192.0,
     )
 
+    scale_multiplier: FloatProperty(
+        name="Scale Multiplier",
+        description="Extra multiplier on top of Source 1:1 (1.905 cm/HU). Use 1.2 for Fortnite character clearance.",
+        default=1.0,
+        min=0.1,
+        max=10.0,
+    )
+
     def invoke(self, context, event):
+        if not self.tf2_path:
+            self.tf2_path = _default_tf2_dir()
         if not self.directory:
-            # Default export directory adjacent to active blend or in user's UEFN project folder
             blend_dir = Path(bpy.data.filepath).parent if bpy.data.filepath else Path.home()
             self.directory = str(blend_dir / "UEFN_Export")
         context.window_manager.fileselect_add(self)
@@ -99,28 +119,24 @@ class SOURCEIO_OT_ExportUEFN(Operator):
         out_dir = Path(self.directory)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        tf2_dir = Path(self.tf2_path) if self.tf2_path else None
+        tf2_dir = Path(self.tf2_path) if self.tf2_path else detect_tf2_game_dir()
 
-        # Look for active map name or BSP file in scene properties
-        map_name = "ctf_2fort"
-        for col in bpy.data.collections:
-            if col.name.endswith(".bsp"):
-                map_name = col.name[:-4]
-                break
+        # Resolve BSP file path: explicit property -> active Blender collection -> tf/maps/
+        bsp_path = Path(self.bsp_filepath) if self.bsp_filepath else None
+        if not bsp_path or not bsp_path.exists():
+            map_name = None
+            for col in bpy.data.collections:
+                if col.name.endswith(".bsp"):
+                    map_name = col.name[:-4]
+                    break
+            if map_name and tf2_dir and (tf2_dir / "maps" / f"{map_name}.bsp").exists():
+                bsp_path = tf2_dir / "maps" / f"{map_name}.bsp"
 
-        # Check if BSP file is available
-        bsp_path = None
-        if tf2_dir and (tf2_dir / "maps" / f"{map_name}.bsp").exists():
-            bsp_path = tf2_dir / "maps" / f"{map_name}.bsp"
-        else:
-            # Check default test map
-            fallback_bsp = Path(r"H:\SteamLibrary\steamapps\common\Team Fortress 2\tf\maps\ctf_2fort.bsp")
-            if fallback_bsp.exists():
-                bsp_path = fallback_bsp
-                map_name = "ctf_2fort"
-
-        if not bsp_path:
-            self.report({"ERROR"}, f"Could not locate BSP map file for {map_name}.")
+        if not bsp_path or not bsp_path.exists():
+            self.report(
+                {"ERROR"},
+                "Could not locate .bsp map file. Set 'BSP Map File' or import a BSP first.",
+            )
             return {"CANCELLED"}
 
         options = UEFNExportOptions(
@@ -131,6 +147,7 @@ class SOURCEIO_OT_ExportUEFN(Operator):
             max_texture_size=int(self.max_texture_size),
             world_chunk_size=self.world_chunk_size,
             export_audio=self.export_audio,
+            scale_multiplier=self.scale_multiplier,
         )
 
         pipeline = UEFNExportPipeline(options)
@@ -139,12 +156,12 @@ class SOURCEIO_OT_ExportUEFN(Operator):
         if result.get("status") == "ok":
             self.report(
                 {"INFO"},
-                f"Exported {result['total_actors']} actors to UEFN! Manifest: {result['manifest_path']}",
+                f"Exported {result['total_actors']} actors, {result['exported_meshes']} meshes, "
+                f"{result['exported_textures']} textures to {out_dir}",
             )
             return {"FINISHED"}
-        else:
-            self.report({"ERROR"}, f"Export failed: {result.get('error')}")
-            return {"CANCELLED"}
+        self.report({"ERROR"}, f"Export failed: {result.get('error')}")
+        return {"CANCELLED"}
 
 
 class SOURCEIO_PT_UEFNExport(Panel):
