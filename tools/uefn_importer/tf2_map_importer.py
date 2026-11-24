@@ -296,6 +296,112 @@ def run_spawn_actors_only(
     }
 
 
+@register_tool(
+    name="tf2_build_materials",
+    category="TF2",
+    description="Auto-creates Master Materials and builds MaterialInstanceConstants from materials_index.json.",
+    tags=["tf2", "materials", "textures", "batch"],
+)
+def run_build_materials(
+    manifest_path: str = "",
+    configure_textures: bool = False,
+    offset: int = 0,
+    limit: int = 0,
+    **kwargs,
+) -> dict[str, Any]:
+    if not IN_UNREAL:
+        return {"status": "error", "error": "This tool must be run inside UEFN."}
+    manifest_file = _resolve_manifest_path(manifest_path)
+    if not manifest_file.exists():
+        return {"status": "error", "error": f"Manifest not found: {manifest_file}"}
+    base_pkg = _base_content_path()
+    res = _configure_textures_and_materials(
+        manifest_file.parent,
+        base_pkg,
+        configure_textures=configure_textures,
+        mi_offset=offset,
+        mi_limit=limit,
+    )
+    return {"status": "ok", "project_mount": base_pkg, **res}
+
+
+@register_tool(
+    name="tf2_apply_materials",
+    category="TF2",
+    description="Applies MI_* MaterialInstances (and refreshes StaticMesh assets) on spawned TF2 actors in batches.",
+    tags=["tf2", "materials", "actors", "batch"],
+)
+def run_apply_materials(
+    manifest_path: str = "",
+    offset: int = 0,
+    limit: int = 0,
+    refresh_mesh: bool = False,
+    **kwargs,
+) -> dict[str, Any]:
+    if not IN_UNREAL:
+        return {"status": "error", "error": "This tool must be run inside UEFN."}
+    manifest_file = _resolve_manifest_path(manifest_path)
+    if not manifest_file.exists():
+        return {"status": "error", "error": f"Manifest not found: {manifest_file}"}
+
+    with open(manifest_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    manifest_map = {
+        a.get("actor_name", ""): a
+        for a in data.get("actors", [])
+        if a.get("actor_name")
+    }
+    base_pkg = _base_content_path()
+    actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    all_actors = actor_sub.get_all_level_actors()
+    tf2_meshes = [
+        a for a in all_actors
+        if isinstance(a, unreal.StaticMeshActor) and a.get_actor_label() in manifest_map
+    ]
+    total = len(tf2_meshes)
+    if offset > 0 or limit > 0:
+        end = offset + limit if limit > 0 else total
+        tf2_meshes = tf2_meshes[offset:end]
+
+    mat_cache: dict[str, Optional[unreal.MaterialInterface]] = {}
+    mesh_cache: dict[str, Optional[unreal.StaticMesh]] = {}
+    updated = 0
+    slots_set = 0
+
+    with unreal.ScopedEditorTransaction(f"TF2 Apply Materials {offset}-{offset + len(tf2_meshes)}") as _:
+        for actor in tf2_meshes:
+            rec = manifest_map[actor.get_actor_label()]
+            sm_comp = getattr(actor, "static_mesh_component", None)
+            if not sm_comp:
+                continue
+            asset_ref = rec.get("asset_reference") or ""
+            if refresh_mesh and asset_ref.endswith(".fbx"):
+                mesh_stem = Path(asset_ref).stem
+                if mesh_stem not in mesh_cache:
+                    mesh_cache[mesh_stem] = load_asset(f"{base_pkg}/Meshes/{mesh_stem}")
+                sm = mesh_cache[mesh_stem]
+                if isinstance(sm, unreal.StaticMesh):
+                    sm_comp.set_static_mesh(sm)
+
+            mat_overrides = rec.get("material_overrides", [])
+            for slot_i, mi_name in enumerate(mat_overrides):
+                if mi_name not in mat_cache:
+                    mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
+                mi_obj = mat_cache[mi_name]
+                if isinstance(mi_obj, unreal.MaterialInterface):
+                    sm_comp.set_material(slot_i, mi_obj)
+                    slots_set += 1
+            updated += 1
+
+    return {
+        "status": "ok",
+        "total_actors": total,
+        "updated_actors": updated,
+        "slots_assigned": slots_set,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal Implementation Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,62 +520,203 @@ def _import_all_assets(
     return {"total_tasks": total_tasks, "imported_count": imported_count, "failures": failures}
 
 
-def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict[str, Any]:
+def _ensure_master_material(
+    materials_pkg: str,
+    master_name: str,
+    default_diffuse: Optional[Any],
+    default_normal: Optional[Any],
+) -> Optional[Any]:
+    """Create a UEFN Master Material with MaterialEditingLibrary if missing."""
+    master_path = f"{materials_pkg}/{master_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(master_path):
+        return load_asset(master_path)
+
+    try:
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        mat = asset_tools.create_asset(master_name, materials_pkg, unreal.Material, unreal.MaterialFactoryNew())
+        if not isinstance(mat, unreal.Material):
+            return None
+
+        is_masked = "Masked" in master_name
+        is_translucent = any(k in master_name for k in ("Translucent", "Water", "Decal"))
+        is_unlit = "Unlit" in master_name
+        is_disp = "Displacement" in master_name
+        is_two_sided = any(k in master_name for k in ("World", "Water", "Displacement", "Decal"))
+
+        try:
+            if is_masked:
+                mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+            elif is_translucent:
+                mat.set_editor_property("blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+            if is_unlit:
+                mat.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+            if is_two_sided:
+                mat.set_editor_property("two_sided", True)
+        except Exception:
+            pass
+
+        mel = unreal.MaterialEditingLibrary
+        base_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -500, -150)
+        base_tex.set_editor_property("parameter_name", "BaseColorTexture")
+        if default_diffuse:
+            base_tex.set_editor_property("texture", default_diffuse)
+
+        color_src = base_tex
+        if is_disp:
+            base_tex2 = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -500, 120)
+            base_tex2.set_editor_property("parameter_name", "BaseColorTexture2")
+            if default_diffuse:
+                base_tex2.set_editor_property("texture", default_diffuse)
+            vcol = mel.create_material_expression(mat, unreal.MaterialExpressionVertexColor, -500, 320)
+            lerp = mel.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -240, -20)
+            mel.connect_material_expressions(base_tex, "RGB", lerp, "A")
+            mel.connect_material_expressions(base_tex2, "RGB", lerp, "B")
+            mel.connect_material_expressions(vcol, "A", lerp, "Alpha")
+            color_src = lerp
+
+        tint = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -260, -300)
+        tint.set_editor_property("parameter_name", "BaseColorTint")
+        tint.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+        mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -80, -150)
+        mel.connect_material_expressions(color_src, "" if is_disp else "RGB", mul, "A")
+        mel.connect_material_expressions(tint, "RGB", mul, "B")
+
+        if is_unlit:
+            mel.connect_material_property(mul, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+        else:
+            mel.connect_material_property(mul, "", unreal.MaterialProperty.MP_BASE_COLOR)
+            rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -200, 150)
+            rough.set_editor_property("parameter_name", "Roughness")
+            rough.set_editor_property("default_value", 0.85)
+            mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+            spec = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -200, 260)
+            spec.set_editor_property("parameter_name", "Specular")
+            spec.set_editor_property("default_value", 0.2)
+            mel.connect_material_property(spec, "", unreal.MaterialProperty.MP_SPECULAR)
+
+            if default_normal:
+                norm_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -500, 420)
+                norm_tex.set_editor_property("parameter_name", "NormalTexture")
+                try:
+                    norm_tex.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+                except Exception:
+                    pass
+                norm_tex.set_editor_property("texture", default_normal)
+                mel.connect_material_property(norm_tex, "RGB", unreal.MaterialProperty.MP_NORMAL)
+
+        if is_masked:
+            mel.connect_material_property(base_tex, "A", unreal.MaterialProperty.MP_OPACITY_MASK)
+        elif is_translucent:
+            op_param = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -260, 40)
+            op_param.set_editor_property("parameter_name", "Opacity")
+            op_param.set_editor_property("default_value", 0.7 if "Water" in master_name else 1.0)
+            op_mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -80, 40)
+            mel.connect_material_expressions(base_tex, "A", op_mul, "A")
+            mel.connect_material_expressions(op_param, "", op_mul, "B")
+            mel.connect_material_property(op_mul, "", unreal.MaterialProperty.MP_OPACITY)
+
+        mel.recompile_material(mat)
+        save_asset(master_path)
+        return mat
+    except Exception as e:
+        log_warning(f"Failed creating Master Material {master_name}: {e}")
+        return None
+
+
+def _configure_textures_and_materials(
+    manifest_dir: Path,
+    base_pkg: str,
+    configure_textures: bool = True,
+    mi_offset: int = 0,
+    mi_limit: int = 0,
+) -> dict[str, Any]:
     """
-    Sets Texture2D sRGB/CompressionSettings and creates MaterialInstanceConstants
-    from Materials/materials_index.json.
+    Sets Texture2D sRGB/CompressionSettings, auto-creates Master Materials if missing,
+    and creates MaterialInstanceConstants from Materials/materials_index.json.
     """
     index_file = manifest_dir / "Materials" / "materials_index.json"
     if not index_file.exists():
-        return {"materials_created": 0, "manual_steps": [], "failures": []}
+        return {"total_materials": 0, "materials_created": 0, "manual_steps": [], "failures": []}
 
     with open(index_file, "r", encoding="utf-8") as f:
         index_data = json.load(f)
 
     failures: list[str] = []
     manual_steps: list[str] = []
+    dirty_assets: list[Any] = []
+    tex_cache: dict[str, Optional[Any]] = {}
+
+    def _get_tex(stem: str) -> Optional[Any]:
+        if stem not in tex_cache:
+            tex_cache[stem] = load_asset(f"{base_pkg}/Textures/{stem}")
+        return tex_cache[stem]
 
     # 1. Configure Textures (sRGB + Compression) — only modify & batch-save changed textures
-    dirty_assets: list[Any] = []
-    for tex_stem, meta in index_data.get("textures", {}).items():
-        tex_path = f"{base_pkg}/Textures/{tex_stem}"
-        tex_obj = load_asset(tex_path)
-        if not isinstance(tex_obj, unreal.Texture2D):
-            continue
-        try:
-            is_srgb = bool(meta.get("is_srgb", True))
-            tex_type = meta.get("texture_type", "diffuse")
-            changed = False
-            if bool(tex_obj.get_editor_property("srgb")) != is_srgb:
-                tex_obj.set_editor_property("srgb", is_srgb)
-                changed = True
-            if tex_type == "normal":
-                if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_NORMALMAP:
-                    tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+    if configure_textures:
+        for tex_stem, meta in index_data.get("textures", {}).items():
+            tex_obj = _get_tex(tex_stem)
+            if not isinstance(tex_obj, unreal.Texture2D):
+                continue
+            try:
+                is_srgb = bool(meta.get("is_srgb", True))
+                tex_type = meta.get("texture_type", "diffuse")
+                changed = False
+                if bool(tex_obj.get_editor_property("srgb")) != is_srgb:
+                    tex_obj.set_editor_property("srgb", is_srgb)
                     changed = True
-                if tex_obj.get_editor_property("lod_group") != unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP:
-                    tex_obj.set_editor_property("lod_group", unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP)
-                    changed = True
-            elif tex_type in ("mask", "blend"):
-                if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_MASKS:
-                    tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
-                    changed = True
-            if changed:
-                dirty_assets.append(tex_obj)
-        except Exception as e:
-            failures.append(f"Texture config error ({tex_stem}): {e}")
+                if tex_type == "normal":
+                    if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_NORMALMAP:
+                        tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_NORMALMAP)
+                        changed = True
+                    if tex_obj.get_editor_property("lod_group") != unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP:
+                        tex_obj.set_editor_property("lod_group", unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP)
+                        changed = True
+                elif tex_type in ("mask", "blend"):
+                    if tex_obj.get_editor_property("compression_settings") != unreal.TextureCompressionSettings.TC_MASKS:
+                        tex_obj.set_editor_property("compression_settings", unreal.TextureCompressionSettings.TC_MASKS)
+                        changed = True
+                if changed:
+                    dirty_assets.append(tex_obj)
+            except Exception as e:
+                failures.append(f"Texture config error ({tex_stem}): {e}")
 
-    # 2. Check Master Materials & Build Material Instances
+    # 2. Ensure Master Materials & Build Material Instances
     materials_pkg = f"{base_pkg}/Materials"
     ensure_folder(materials_pkg)
+    default_diffuse = load_asset("/Engine/EngineResources/DefaultTexture")
+    default_normal = None
+    for tex_stem, meta in index_data.get("textures", {}).items():
+        if meta.get("texture_type") == "diffuse" and default_diffuse is None:
+            cand = _get_tex(tex_stem)
+            if isinstance(cand, unreal.Texture):
+                default_diffuse = cand
+        elif meta.get("texture_type") == "normal" and default_normal is None:
+            cand = _get_tex(tex_stem)
+            if isinstance(cand, unreal.Texture):
+                default_normal = cand
+        if default_diffuse is not None and default_normal is not None:
+            break
+
+    all_mat_items = list(index_data.get("materials", {}).items())
+    total_materials = len(all_mat_items)
+    if mi_offset > 0 or mi_limit > 0:
+        end = mi_offset + mi_limit if mi_limit > 0 else total_materials
+        all_mat_items = all_mat_items[mi_offset:end]
+
     materials_created = 0
     missing_masters: set[str] = set()
 
-    for mi_name, spec in index_data.get("materials", {}).items():
+    for mi_name, spec in all_mat_items:
         master_name = spec.get("master_material_name", "M_Master_World")
         master_path = f"{materials_pkg}/{master_name}"
         if not unreal.EditorAssetLibrary.does_asset_exist(master_path):
+            _ensure_master_material(materials_pkg, master_name, default_diffuse, default_normal)
+        if not unreal.EditorAssetLibrary.does_asset_exist(master_path):
             fallback_master = f"{materials_pkg}/M_Master_Fallback"
+            if not unreal.EditorAssetLibrary.does_asset_exist(fallback_master):
+                _ensure_master_material(materials_pkg, "M_Master_Fallback", default_diffuse, default_normal)
             if unreal.EditorAssetLibrary.does_asset_exist(fallback_master):
                 master_path = fallback_master
             else:
@@ -482,7 +729,7 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
             continue
 
         for param_name, tex_stem in spec.get("textures", {}).items():
-            tex_obj = load_asset(f"{base_pkg}/Textures/{tex_stem}")
+            tex_obj = _get_tex(tex_stem)
             if isinstance(tex_obj, unreal.Texture):
                 try:
                     set_mi_texture(mi, param_name, tex_obj)
@@ -501,6 +748,11 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
                     set_mi_vector(mi, v_name, unreal.LinearColor(v_val[0], v_val[1], v_val[2], v_val[3]))
                 except Exception:
                     pass
+
+        try:
+            unreal.MaterialEditingLibrary.update_material_instance(mi)
+        except Exception:
+            pass
 
         dirty_assets.append(mi)
         materials_created += 1
@@ -524,6 +776,7 @@ def _configure_textures_and_materials(manifest_dir: Path, base_pkg: str) -> dict
         )
 
     return {
+        "total_materials": total_materials,
         "materials_created": materials_created,
         "manual_steps": manual_steps,
         "failures": failures,

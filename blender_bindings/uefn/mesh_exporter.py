@@ -90,6 +90,27 @@ def get_material_source_path(mat: Any) -> str:
     return str(mat.name)
 
 
+def _clean_and_triangulate_bmesh(bm: Any) -> None:
+    """Remove loose edges/verts and degenerate triangles so UE5 Interchange never fails MeshDescription."""
+    loose_edges = [e for e in bm.edges if not e.link_faces]
+    if loose_edges:
+        bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
+    loose_verts = [v for v in bm.verts if not v.link_faces]
+    if loose_verts:
+        bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+    if bm.faces:
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        zero_faces = [f for f in bm.faces if f.calc_area() < 1e-10]
+        if zero_faces:
+            bmesh.ops.delete(bm, geom=zero_faces, context="FACES")
+        loose_edges = [e for e in bm.edges if not e.link_faces]
+        if loose_edges:
+            bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
+        loose_verts = [v for v in bm.verts if not v.link_faces]
+        if loose_verts:
+            bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+
+
 class ExportedMeshInfo:
     def __init__(
         self,
@@ -426,10 +447,7 @@ class UEFNMeshExporter:
                 )
                 if del_faces:
                     bmesh.ops.delete(cbm, geom=list(set(del_faces)), context="FACES")
-                # Delete loose verts
-                loose_verts = [v for v in cbm.verts if not v.link_faces]
-                if loose_verts:
-                    bmesh.ops.delete(cbm, geom=loose_verts, context="VERTS")
+                _clean_and_triangulate_bmesh(cbm)
 
                 cbm.to_mesh(chunk_mesh)
                 cbm.free()
@@ -574,9 +592,7 @@ class UEFNMeshExporter:
             del_faces = [f for f in bm.faces if f.material_index in tool_indices]
             if del_faces:
                 bmesh.ops.delete(bm, geom=del_faces, context="FACES")
-            loose_verts = [v for v in bm.verts if not v.link_faces]
-            if loose_verts:
-                bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+            _clean_and_triangulate_bmesh(bm)
             bm.to_mesh(dup_mesh)
             bm.free()
 
