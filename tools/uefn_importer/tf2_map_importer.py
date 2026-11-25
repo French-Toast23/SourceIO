@@ -335,6 +335,51 @@ def run_build_materials(
     return {"status": "ok", "project_mount": base_pkg, **res}
 
 
+def _assign_actor_materials(
+    sm_comp: Any,
+    mat_overrides: list[str],
+    base_pkg: str,
+    mat_cache: dict[str, Optional[unreal.MaterialInterface]],
+    prefer_slot_names: bool = True,
+) -> int:
+    """Assign MI_* materials matching UEFN slot names when possible (Interchange may reorder slots)."""
+    assigned = 0
+    slot_names: list[str] = []
+    if prefer_slot_names:
+        try:
+            slot_names = [str(n) for n in sm_comp.get_material_slot_names()]
+        except Exception:
+            slot_names = []
+
+    if slot_names:
+        override_set = set(mat_overrides)
+        for slot_i, s_name in enumerate(slot_names):
+            mi_name = (
+                s_name
+                if (s_name in override_set or s_name.startswith("MI_"))
+                else (mat_overrides[slot_i] if slot_i < len(mat_overrides) else "")
+            )
+            if not mi_name:
+                continue
+            if mi_name not in mat_cache:
+                mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
+            mi_obj = mat_cache[mi_name]
+            if isinstance(mi_obj, unreal.MaterialInterface):
+                sm_comp.set_material(slot_i, mi_obj)
+                assigned += 1
+        if assigned > 0:
+            return assigned
+
+    for slot_i, mi_name in enumerate(mat_overrides):
+        if mi_name not in mat_cache:
+            mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
+        mi_obj = mat_cache[mi_name]
+        if isinstance(mi_obj, unreal.MaterialInterface):
+            sm_comp.set_material(slot_i, mi_obj)
+            assigned += 1
+    return assigned
+
+
 @register_tool(
     name="tf2_apply_materials",
     category="TF2",
@@ -395,13 +440,14 @@ def run_apply_materials(
                     sm_comp.set_static_mesh(sm)
 
             mat_overrides = rec.get("material_overrides", [])
-            for slot_i, mi_name in enumerate(mat_overrides):
-                if mi_name not in mat_cache:
-                    mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
-                mi_obj = mat_cache[mi_name]
-                if isinstance(mi_obj, unreal.MaterialInterface):
-                    sm_comp.set_material(slot_i, mi_obj)
-                    slots_set += 1
+            skin_idx = int((rec.get("source_entity_data") or {}).get("skin", 0) or 0)
+            slots_set += _assign_actor_materials(
+                sm_comp,
+                mat_overrides,
+                base_pkg,
+                mat_cache,
+                prefer_slot_names=(skin_idx == 0),
+            )
             updated += 1
 
     return {
@@ -919,12 +965,14 @@ def _spawn_actors_in_batches(
                             sm_comp = getattr(actor, "static_mesh_component", None)
                             if sm_comp and isinstance(mesh_obj, unreal.StaticMesh):
                                 sm_comp.set_static_mesh(mesh_obj)
-                                for slot_i, mi_name in enumerate(mat_overrides):
-                                    if mi_name not in mat_cache:
-                                        mat_cache[mi_name] = load_asset(f"{base_pkg}/Materials/{mi_name}")
-                                    mi_obj = mat_cache[mi_name]
-                                    if isinstance(mi_obj, unreal.MaterialInterface):
-                                        sm_comp.set_material(slot_i, mi_obj)
+                                skin_idx = int((a_data.get("source_entity_data") or {}).get("skin", 0) or 0)
+                                _assign_actor_materials(
+                                    sm_comp,
+                                    mat_overrides,
+                                    base_pkg,
+                                    mat_cache,
+                                    prefer_slot_names=(skin_idx == 0),
+                                )
                         folder = (
                             "TF2_Map/Skybox" if is_skybox
                             else ("TF2_Map/World" if ent_class == "worldspawn"

@@ -563,12 +563,15 @@ class UEFNMeshExporter:
             old_to_new[idx] = new_idx
 
         mesh = obj.data
+        # Preserve original polygon material indices BEFORE clear(), because
+        # Blender's mesh.materials.clear() resets every poly.material_index to 0!
+        orig_indices = [poly.material_index for poly in mesh.polygons]
         mesh.materials.clear()
         for pm in new_mats:
             mesh.materials.append(pm)
         if old_to_new:
-            for poly in mesh.polygons:
-                poly.material_index = old_to_new.get(poly.material_index, 0)
+            for poly, old_idx in zip(mesh.polygons, orig_indices):
+                poly.material_index = old_to_new.get(old_idx, 0)
 
         return ue_names, src_paths
 
