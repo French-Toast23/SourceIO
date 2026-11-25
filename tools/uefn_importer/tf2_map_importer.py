@@ -440,7 +440,6 @@ def _import_all_assets(
     limit: int = 0,
 ) -> dict[str, Any]:
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-    tasks: list[unreal.AssetImportTask] = []
     failures: list[str] = []
 
     meshes_dir = manifest_dir / "Meshes"
@@ -450,16 +449,32 @@ def _import_all_assets(
     for sub in ("Meshes", "Textures", "Materials", "Audio"):
         ensure_folder(f"{base_pkg}/{sub}")
 
+    pending_specs: list[tuple[str, Path]] = []
     if meshes_dir.exists():
         for fbx in sorted(meshes_dir.glob("*.fbx")):
-            task = unreal.AssetImportTask()
-            task.filename = str(fbx)
-            task.destination_path = f"{base_pkg}/Meshes"
-            task.destination_name = fbx.stem
-            task.replace_existing = True
-            task.automated = True
-            task.save = True
+            pending_specs.append(("mesh", fbx))
+    if textures_dir.exists():
+        for tex_file in sorted(list(textures_dir.glob("*.png")) + list(textures_dir.glob("*.tga"))):
+            pending_specs.append(("tex", tex_file))
+    if audio_dir.exists():
+        for wav_file in sorted(audio_dir.glob("*.wav")):
+            pending_specs.append(("audio", wav_file))
 
+    total_tasks = len(pending_specs)
+    if offset > 0 or limit > 0:
+        end = offset + limit if limit > 0 else total_tasks
+        pending_specs = pending_specs[offset:end]
+
+    tasks: list[unreal.AssetImportTask] = []
+    for kind, src_path in pending_specs:
+        task = unreal.AssetImportTask()
+        task.filename = str(src_path)
+        task.destination_name = src_path.stem
+        task.replace_existing = True
+        task.automated = True
+        task.save = True
+        if kind == "mesh":
+            task.destination_path = f"{base_pkg}/Meshes"
             fbx_options = unreal.FbxImportUI()
             fbx_options.import_mesh = True
             fbx_options.import_textures = False
@@ -468,34 +483,11 @@ def _import_all_assets(
             fbx_options.static_mesh_import_data.combine_meshes = True
             fbx_options.static_mesh_import_data.auto_generate_collision = False
             task.options = fbx_options
-            tasks.append(task)
-
-    if textures_dir.exists():
-        for tex_file in sorted(list(textures_dir.glob("*.png")) + list(textures_dir.glob("*.tga"))):
-            task = unreal.AssetImportTask()
-            task.filename = str(tex_file)
+        elif kind == "tex":
             task.destination_path = f"{base_pkg}/Textures"
-            task.destination_name = tex_file.stem
-            task.replace_existing = True
-            task.automated = True
-            task.save = True
-            tasks.append(task)
-
-    if audio_dir.exists():
-        for wav_file in sorted(audio_dir.glob("*.wav")):
-            task = unreal.AssetImportTask()
-            task.filename = str(wav_file)
+        else:
             task.destination_path = f"{base_pkg}/Audio"
-            task.destination_name = wav_file.stem
-            task.replace_existing = True
-            task.automated = True
-            task.save = True
-            tasks.append(task)
-
-    total_tasks = len(tasks)
-    if offset > 0 or limit > 0:
-        end = offset + limit if limit > 0 else total_tasks
-        tasks = tasks[offset:end]
+        tasks.append(task)
 
     imported_count = 0
     for i in range(0, len(tasks), batch_size):
@@ -526,6 +518,11 @@ def _import_all_assets(
                     save_asset(f"{base_pkg}/Meshes/{stem}")
             except Exception as e:
                 log_warning(f"Could not set ComplexAsSimple on {stem}: {e}")
+
+    try:
+        unreal.SystemLibrary.collect_garbage()
+    except Exception:
+        pass
 
     return {"total_tasks": total_tasks, "imported_count": imported_count, "failures": failures}
 
@@ -811,6 +808,10 @@ def _configure_textures_and_materials(
                     unreal.EditorAssetLibrary.save_loaded_asset(obj, only_if_is_dirty=True)
                 except Exception:
                     pass
+    try:
+        unreal.SystemLibrary.collect_garbage()
+    except Exception:
+        pass
 
     if missing_masters:
         manual_steps.append(
