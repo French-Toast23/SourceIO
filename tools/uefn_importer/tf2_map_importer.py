@@ -769,6 +769,8 @@ def _configure_textures_and_materials(
         if mi is None:
             failures.append(f"Failed creating MaterialInstance {mi_name}")
             continue
+        if not _created:
+            continue
 
         for param_name, tex_stem in spec.get("textures", {}).items():
             tex_obj = _get_tex(tex_stem)
