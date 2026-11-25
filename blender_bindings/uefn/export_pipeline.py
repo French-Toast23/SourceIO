@@ -475,10 +475,25 @@ class UEFNExportPipeline:
         dz = origin_hu[2] - self._sky_camera_origin_hu[2]
         dist_to_sky = (dx * dx + dy * dy + dz * dz) ** 0.5
         dist_to_world_origin = (origin_hu[0] ** 2 + origin_hu[1] ** 2 + origin_hu[2] ** 2) ** 0.5
-        # Skybox room is typically a small sealed box (< 1500 HU radius) centered on sky_camera
-        return dist_to_sky < 1500.0 and dist_to_sky < dist_to_world_origin
+        # Skybox room is typically a small sealed box (< 1800 HU radius) centered on sky_camera
+        return dist_to_sky < 1800.0 and dist_to_sky < dist_to_world_origin
+
+    def _skybox_pivot_and_location(self) -> Optional[tuple[list[float], list[float]]]:
+        """Return (pivot_offset_bu, unreal_location_cm) when a 3D sky_camera is present."""
+        if self._sky_camera_origin_hu is None:
+            return None
+        pivot_bu = [float(c) * self.blender_scale for c in self._sky_camera_origin_hu]
+        loc_cm = source_to_unreal_position(
+            self._sky_camera_origin_hu,
+            cm_per_hu=self.options.cm_per_hu,
+            scale_multiplier=self.options.scale_multiplier,
+        )
+        return pivot_bu, loc_cm
 
     def _export_world_and_displacements(self, map_collection: Any) -> None:
+        sky_info = self._skybox_pivot_and_location()
+        playable_filter = (lambda pt: not self._is_point_in_skybox(pt)) if sky_info else None
+
         world_objs = [
             o for o in map_collection.objects
             if o.type == "MESH" and "world_geometry" in o.name.lower()
@@ -489,6 +504,7 @@ class UEFNExportPipeline:
                 world_objs,
                 prefix="world_chunk",
                 on_material_seen=self._on_material_seen,
+                face_filter=playable_filter,
             )
             for chunk in chunks:
                 self.manifest_builder.exported_counts["world_chunks"] += 1
@@ -502,6 +518,28 @@ class UEFNExportPipeline:
                     material_overrides=chunk.materials,
                     source_entity_data={"triangle_count": chunk.triangle_count, "chunk": True},
                 ))
+            if sky_info:
+                sky_pivot_bu, sky_loc_cm = sky_info
+                sky_chunks = self.mesh_exporter.export_spatial_world_chunks(
+                    world_objs,
+                    prefix="skybox_world_chunk",
+                    on_material_seen=self._on_material_seen,
+                    face_filter=self._is_point_in_skybox,
+                    pivot_offset_bu=sky_pivot_bu,
+                )
+                for chunk in sky_chunks:
+                    self.manifest_builder.exported_counts["world_chunks"] += 1
+                    self.manifest_builder.add_actor(PlacedActorRecord(
+                        actor_name=chunk.mesh_name,
+                        asset_reference=chunk.fbx_path.name,
+                        location=list(sky_loc_cm),
+                        rotation=[0.0, 0.0, 0.0],
+                        scale=[1.0, 1.0, 1.0],
+                        entity_class="worldspawn",
+                        material_overrides=chunk.materials,
+                        source_entity_data={"triangle_count": chunk.triangle_count, "chunk": True},
+                        is_skybox=True,
+                    ))
 
         # Displacements
         disp_col = map_collection.children.get("displacements")
@@ -513,6 +551,7 @@ class UEFNExportPipeline:
                     disp_objs,
                     prefix="disp_chunk",
                     on_material_seen=self._on_material_seen,
+                    face_filter=playable_filter,
                 )
                 for chunk in disp_chunks:
                     self.manifest_builder.exported_counts["displacements"] += 1
@@ -526,6 +565,28 @@ class UEFNExportPipeline:
                         material_overrides=chunk.materials,
                         source_entity_data={"triangle_count": chunk.triangle_count, "displacement": True},
                     ))
+                if sky_info:
+                    sky_pivot_bu, sky_loc_cm = sky_info
+                    sky_disp_chunks = self.mesh_exporter.export_spatial_world_chunks(
+                        disp_objs,
+                        prefix="skybox_disp_chunk",
+                        on_material_seen=self._on_material_seen,
+                        face_filter=self._is_point_in_skybox,
+                        pivot_offset_bu=sky_pivot_bu,
+                    )
+                    for chunk in sky_disp_chunks:
+                        self.manifest_builder.exported_counts["displacements"] += 1
+                        self.manifest_builder.add_actor(PlacedActorRecord(
+                            actor_name=chunk.mesh_name,
+                            asset_reference=chunk.fbx_path.name,
+                            location=list(sky_loc_cm),
+                            rotation=[0.0, 0.0, 0.0],
+                            scale=[1.0, 1.0, 1.0],
+                            entity_class="displacement",
+                            material_overrides=chunk.materials,
+                            source_entity_data={"triangle_count": chunk.triangle_count, "displacement": True},
+                            is_skybox=True,
+                        ))
 
     def _export_brush_entities(self, map_collection: Any) -> None:
         """
@@ -614,6 +675,10 @@ class UEFNExportPipeline:
                         scale_multiplier=self.options.scale_multiplier,
                     )
                     ue_rot = blender_euler_to_unreal_rotation(obj.rotation_euler)
+                    factor = self.options.cm_per_hu * self.options.scale_multiplier
+                    center_cm = bounds_cm["center"]
+                    center_hu = [center_cm[0] / factor, -center_cm[1] / factor, center_cm[2] / factor]
+                    is_sky_brush = self._is_point_in_skybox(center_hu)
 
                     self.manifest_builder.exported_counts["brush_entities"] += 1
                     self.manifest_builder.add_actor(PlacedActorRecord(
@@ -626,6 +691,7 @@ class UEFNExportPipeline:
                         material_overrides=mesh_info.materials,
                         source_entity_data=ent_data,
                         is_gameplay_entity=(classname in GAMEPLAY_ENTITY_CLASSES),
+                        is_skybox=is_sky_brush,
                         bounds_cm=bounds_cm,
                     ))
 
@@ -709,11 +775,25 @@ class UEFNExportPipeline:
         ov_obj = bpy.data.objects.new(f"{self.map_name}_overlays", ov_mesh)
         bpy.context.scene.collection.objects.link(ov_obj)
 
+        sky_info = self._skybox_pivot_and_location()
+        playable_filter = (lambda pt: not self._is_point_in_skybox(pt)) if sky_info else None
+
         chunks = self.mesh_exporter.export_spatial_world_chunks(
             [ov_obj],
             prefix="overlays_chunk",
             on_material_seen=self._on_material_seen,
+            face_filter=playable_filter,
         )
+        sky_chunks = []
+        if sky_info:
+            sky_pivot_bu, sky_loc_cm = sky_info
+            sky_chunks = self.mesh_exporter.export_spatial_world_chunks(
+                [ov_obj],
+                prefix="skybox_overlays_chunk",
+                on_material_seen=self._on_material_seen,
+                face_filter=self._is_point_in_skybox,
+                pivot_offset_bu=sky_pivot_bu,
+            )
         bpy.data.objects.remove(ov_obj, do_unlink=True)
         bpy.data.meshes.remove(ov_mesh)
 
@@ -728,6 +808,20 @@ class UEFNExportPipeline:
                 material_overrides=chunk.materials,
                 source_entity_data={"overlays": True},
             ))
+        if sky_info:
+            _, sky_loc_cm = sky_info
+            for chunk in sky_chunks:
+                self.manifest_builder.add_actor(PlacedActorRecord(
+                    actor_name=chunk.mesh_name,
+                    asset_reference=chunk.fbx_path.name,
+                    location=list(sky_loc_cm),
+                    rotation=[0.0, 0.0, 0.0],
+                    scale=[1.0, 1.0, 1.0],
+                    entity_class="info_overlay",
+                    material_overrides=chunk.materials,
+                    source_entity_data={"overlays": True},
+                    is_skybox=True,
+                ))
         self.manifest_builder.exported_counts["overlays_decals"] += len(overlay_lump.overlays)
 
     def _ensure_mdl_exported(self, model_path: str, bodygroup_val: int = 0) -> tuple[Optional[str], list[list[str]]]:

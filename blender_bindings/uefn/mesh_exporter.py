@@ -346,11 +346,13 @@ class UEFNMeshExporter:
         source_objects: list[Any],
         prefix: str = "world_chunk",
         on_material_seen: Optional[Callable[[str], None]] = None,
+        face_filter: Optional[Callable[[list[float]], bool]] = None,
+        pivot_offset_bu: Optional[list[float]] = None,
     ) -> list[ExportedMeshInfo]:
         """
-        Cull tool textures, then spatially split world geometry (or displacements)
-        into XY grid cells of size `self.world_chunk_size` Hammer units and export each
-        non-empty cell as an FBX chunk.
+        Cull tool textures (and optional face filter in Hammer units), then spatially
+        split world geometry (or displacements) into XY grid cells of size
+        `self.world_chunk_size` Hammer units and export each non-empty cell as an FBX chunk.
         """
         if not IN_BLENDER:
             self.errors.append("Cannot export world chunks: Blender (bpy) not available.")
@@ -360,8 +362,6 @@ class UEFNMeshExporter:
         if not mesh_objs:
             return []
 
-        # Group faces per grid cell (gx, gy) by partitioning each source mesh using bmesh
-        chunk_faces: dict[tuple[int, int], list[Any]] = defaultdict(list)
         chunk_size = max(256.0, float(self.world_chunk_size))
 
         # Join copies first so world geometry / displacements chunk cleanly in world space
@@ -392,7 +392,8 @@ class UEFNMeshExporter:
             else:
                 joined_copy = temp_objs[0]
 
-            # Build bmesh and delete tool faces
+            # Build bmesh, delete tool / filtered faces, and write back to joined_copy.data
+            # BEFORE indexing face_cell_map so face indices stay 1:1 with joined_copy.data.
             bm = bmesh.new()
             bm.from_mesh(joined_copy.data)
 
@@ -401,16 +402,28 @@ class UEFNMeshExporter:
                 if slot.material and is_tool_material(get_material_source_path(slot.material)):
                     tool_mat_indices.add(idx)
 
-            tool_faces = [f for f in bm.faces if f.material_index in tool_mat_indices]
-            if tool_faces:
-                bmesh.ops.delete(bm, geom=tool_faces, context="FACES")
+            drop_faces = []
+            for f in bm.faces:
+                if f.material_index in tool_mat_indices:
+                    drop_faces.append(f)
+                    continue
+                if face_filter is not None:
+                    c = f.calc_center_median()
+                    if not face_filter([c.x / self.blender_scale, c.y / self.blender_scale, c.z / self.blender_scale]):
+                        drop_faces.append(f)
+
+            if drop_faces:
+                bmesh.ops.delete(bm, geom=drop_faces, context="FACES")
 
             if len(bm.faces) == 0:
                 bm.free()
                 return []
 
-            # Bucket remaining faces by XY grid cell in Hammer units
+            bm.to_mesh(joined_copy.data)
+            joined_copy.data.update()
             bm.faces.ensure_lookup_table()
+
+            # Bucket remaining faces (exact 1:1 indices with joined_copy.data) by XY grid cell in Hammer units
             face_cell_map: dict[tuple[int, int], list[int]] = defaultdict(list)
             for face_idx, face in enumerate(bm.faces):
                 center = face.calc_center_median()
@@ -421,6 +434,13 @@ class UEFNMeshExporter:
                 face_cell_map[(gx, gy)].append(face_idx)
 
             bm.free()
+
+            px, py, pz = (
+                (float(pivot_offset_bu[0]), float(pivot_offset_bu[1]), float(pivot_offset_bu[2]))
+                if pivot_offset_bu is not None
+                else (0.0, 0.0, 0.0)
+            )
+            has_pivot_shift = pivot_offset_bu is not None and (px != 0.0 or py != 0.0 or pz != 0.0)
 
             exported_chunks: list[ExportedMeshInfo] = []
             for (gx, gy), keep_indices in sorted(face_cell_map.items()):
@@ -440,13 +460,13 @@ class UEFNMeshExporter:
                 cbm.from_mesh(chunk_mesh)
                 cbm.faces.ensure_lookup_table()
                 del_faces = [f for idx, f in enumerate(cbm.faces) if idx not in keep_set]
-                # Also delete tool faces on chunk_mesh (same indices as joined_copy)
-                del_faces.extend(
-                    f for idx, f in enumerate(cbm.faces)
-                    if idx in keep_set and f.material_index in tool_mat_indices
-                )
                 if del_faces:
-                    bmesh.ops.delete(cbm, geom=list(set(del_faces)), context="FACES")
+                    bmesh.ops.delete(cbm, geom=del_faces, context="FACES")
+                if has_pivot_shift:
+                    for v in cbm.verts:
+                        v.co.x -= px
+                        v.co.y -= py
+                        v.co.z -= pz
                 _clean_and_triangulate_bmesh(cbm)
 
                 cbm.to_mesh(chunk_mesh)

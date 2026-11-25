@@ -117,7 +117,7 @@ def run_import_manifest(
     spawn_actors: bool = True,
     batch_size: int = 250,
     clean_existing: bool = True,
-    include_skybox: bool = False,
+    include_skybox: bool = True,
     **kwargs,
 ) -> dict[str, Any]:
     """
@@ -184,7 +184,12 @@ def run_import_manifest(
         results["failures"].extend(mat_res.get("failures", []))
 
     if spawn_actors:
-        spawn_res = _spawn_actors_in_batches(actors_data, base_pkg, batch_size=max(1, batch_size))
+        spawn_res = _spawn_actors_in_batches(
+            actors_data,
+            base_pkg,
+            batch_size=max(1, batch_size),
+            sky_camera=manifest_data.get("sky_camera"),
+        )
         results["actors_spawned"] = spawn_res.get("spawned_count", 0)
         results["failures"].extend(spawn_res.get("failures", []))
 
@@ -265,7 +270,7 @@ def run_import_assets_only(
 def run_spawn_actors_only(
     manifest_path: str = "",
     batch_size: int = 250,
-    include_skybox: bool = False,
+    include_skybox: bool = True,
     offset: int = 0,
     limit: int = 0,
     **kwargs,
@@ -286,7 +291,12 @@ def run_spawn_actors_only(
     if offset > 0 or limit > 0:
         end = offset + limit if limit > 0 else total_actors
         actors = actors[offset:end]
-    res = _spawn_actors_in_batches(actors, _base_content_path(), batch_size=max(1, batch_size))
+    res = _spawn_actors_in_batches(
+        actors,
+        _base_content_path(),
+        batch_size=max(1, batch_size),
+        sky_camera=data.get("sky_camera"),
+    )
     return {
         "status": "ok",
         "total_manifest_actors": total_actors,
@@ -541,7 +551,7 @@ def _ensure_master_material(
         is_translucent = any(k in master_name for k in ("Translucent", "Water", "Decal"))
         is_unlit = "Unlit" in master_name
         is_disp = "Displacement" in master_name
-        is_two_sided = any(k in master_name for k in ("World", "Water", "Displacement", "Decal"))
+        is_two_sided = any(k in master_name for k in ("World", "Water", "Displacement", "Decal", "Masked", "Translucent"))
 
         try:
             if is_masked:
@@ -618,11 +628,42 @@ def _ensure_master_material(
             mel.connect_material_property(op_mul, "", unreal.MaterialProperty.MP_OPACITY)
 
         mel.recompile_material(mat)
-        save_asset(master_path)
         return mat
     except Exception as e:
         log_warning(f"Failed creating Master Material {master_name}: {e}")
         return None
+
+
+def _create_tf2_material_instance(
+    master_path: str,
+    mi_name: str,
+    materials_pkg: str,
+) -> tuple[Optional[Any], bool]:
+    """Create (or reuse) a MaterialInstanceConstant using UEFN-safe MaterialEditingLibrary API."""
+    full_path = f"{materials_pkg}/{mi_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(full_path):
+        existing = load_asset(full_path)
+        if isinstance(existing, unreal.MaterialInstanceConstant):
+            return existing, False
+
+    parent = load_asset(master_path)
+    if not isinstance(parent, unreal.MaterialInterface):
+        return None, False
+
+    try:
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        factory = unreal.MaterialInstanceConstantFactoryNew()
+        mi = asset_tools.create_asset(mi_name, materials_pkg, unreal.MaterialInstanceConstant, factory)
+        if not isinstance(mi, unreal.MaterialInstanceConstant):
+            return None, False
+        try:
+            unreal.MaterialEditingLibrary.set_material_instance_parent(mi, parent)
+        except Exception:
+            mi.set_editor_property("parent", parent)
+        return mi, True
+    except Exception as e:
+        log_warning(f"Failed creating MI {mi_name} from {master_path}: {e}")
+        return None, False
 
 
 def _configure_textures_and_materials(
@@ -712,18 +753,22 @@ def _configure_textures_and_materials(
         master_name = spec.get("master_material_name", "M_Master_World")
         master_path = f"{materials_pkg}/{master_name}"
         if not unreal.EditorAssetLibrary.does_asset_exist(master_path):
-            _ensure_master_material(materials_pkg, master_name, default_diffuse, default_normal)
+            m_obj = _ensure_master_material(materials_pkg, master_name, default_diffuse, default_normal)
+            if m_obj is not None:
+                dirty_assets.append(m_obj)
         if not unreal.EditorAssetLibrary.does_asset_exist(master_path):
             fallback_master = f"{materials_pkg}/M_Master_Fallback"
             if not unreal.EditorAssetLibrary.does_asset_exist(fallback_master):
-                _ensure_master_material(materials_pkg, "M_Master_Fallback", default_diffuse, default_normal)
+                fb_obj = _ensure_master_material(materials_pkg, "M_Master_Fallback", default_diffuse, default_normal)
+                if fb_obj is not None:
+                    dirty_assets.append(fb_obj)
             if unreal.EditorAssetLibrary.does_asset_exist(fallback_master):
                 master_path = fallback_master
             else:
                 missing_masters.add(master_name)
                 continue
 
-        mi = create_material_instance(master_path, mi_name, materials_pkg)
+        mi, _created = _create_tf2_material_instance(master_path, mi_name, materials_pkg)
         if mi is None:
             failures.append(f"Failed creating MaterialInstance {mi_name}")
             continue
@@ -783,10 +828,30 @@ def _configure_textures_and_materials(
     }
 
 
+def project_skybox_actor_transform(
+    loc_list: list[float],
+    scale_list: list[float],
+    is_skybox: bool,
+    sky_camera: Optional[dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    """Project a 3D skybox actor's miniature location & scale to full 1:1 world space."""
+    if not is_skybox or not sky_camera:
+        return [float(loc_list[0]), float(loc_list[1]), float(loc_list[2])], [
+            float(scale_list[0]), float(scale_list[1]), float(scale_list[2])
+        ]
+    sky_origin = sky_camera.get("unreal_location", [0.0, 0.0, 0.0])
+    sky_scale = float(sky_camera.get("sky_scale", 16.0))
+    return (
+        [(float(loc_list[i]) - float(sky_origin[i])) * sky_scale for i in range(3)],
+        [float(scale_list[i]) * sky_scale for i in range(3)],
+    )
+
+
 def _spawn_actors_in_batches(
     actors_data: list[dict[str, Any]],
     base_pkg: str,
     batch_size: int = 250,
+    sky_camera: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     spawned_count = 0
@@ -811,6 +876,10 @@ def _spawn_actors_in_batches(
                 is_skybox = a_data.get("is_skybox", False)
                 mat_overrides = a_data.get("material_overrides", [])
                 audio_spec = a_data.get("audio_spec")
+
+                loc_list, scale_list = project_skybox_actor_transform(
+                    loc_list, scale_list, is_skybox, sky_camera
+                )
 
                 loc = unreal.Vector(float(loc_list[0]), float(loc_list[1]), float(loc_list[2]))
                 rot = unreal.Rotator(

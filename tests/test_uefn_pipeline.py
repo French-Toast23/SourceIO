@@ -289,6 +289,24 @@ class TestUEFNManifestAndSecurity(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 self.assertNotIn(node.module.split(".")[0], blocked)
 
+    def test_skybox_projection_math_in_plugin(self):
+        import importlib.util
+        plugin_path = Path(__file__).resolve().parent.parent / "tools" / "uefn_importer" / "tf2_map_importer.py"
+        spec = importlib.util.spec_from_file_location("tf2_map_importer_test", str(plugin_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        sky_cam = {"unreal_location": [-8656.32, -487.68, 91.44], "sky_scale": 16.0}
+        # Skybox chunk pivoted at sky_camera lands at [0, 0, 0] with 16x scale
+        loc, scale = mod.project_skybox_actor_transform([-8656.32, -487.68, 91.44], [1.0, 1.0, 1.0], True, sky_cam)
+        self.assertEqual([round(v, 3) for v in loc], [0.0, 0.0, 0.0])
+        self.assertEqual(scale, [16.0, 16.0, 16.0])
+
+        # Playable actor (is_skybox=False) keeps exact location & scale
+        p_loc, p_scale = mod.project_skybox_actor_transform([100.0, 200.0, 300.0], [1.0, 1.0, 1.0], False, sky_cam)
+        self.assertEqual(p_loc, [100.0, 200.0, 300.0])
+        self.assertEqual(p_scale, [1.0, 1.0, 1.0])
+
 
 class TestTF2MapIntegration(unittest.TestCase):
     def test_read_ctf_2fort_bsp(self):
